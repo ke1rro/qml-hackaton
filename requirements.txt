@@ -1,6 +1,11 @@
-qiskit>=2.0
-qiskit-aer>=0.15
-qiskit-ibm-runtime>=0.30
-numpy>=1.24
-scipy>=1.10
-matplotlib>=3.7
+haiqu-sdk
+python-dotenv
+psutil
+numpy
+scipy
+matplotlib
+pandas
+qiskit
+qiskit-aer
+qiskit-ibm-runtime
+ipykernel
