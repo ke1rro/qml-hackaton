@@ -135,6 +135,7 @@ def _job_metadata(job: Any) -> dict[str, Any]:
     for name in (
         "id",
         "job_id",
+        "info",
         "time",
         "pre_device_pipeline_time",
         "estimated_qpu_cost",

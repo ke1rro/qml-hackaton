@@ -17,6 +17,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import json
 
 from dotenv import load_dotenv
 from qiskit import QuantumCircuit
@@ -55,6 +56,7 @@ FIELDNAMES = [
     "mitigated_fidelity",
     "status",
     "error",
+    "haiqu_job_info",
 ]
 
 
@@ -242,6 +244,7 @@ def result_row(
     mitigated = output["mitigated"]
     raw = output.get("raw") or {}
     haiqu_job = (output.get("haiqu_jobs") or {}).get("mitigated") or {}
+    haiqu_job_info = haiqu_job.get("info")
     return {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "implementation": implementation,
@@ -258,6 +261,11 @@ def result_row(
         "repetition": repetition,
         **metrics,
         "haiqu_job_id": haiqu_job.get("job_id") or haiqu_job.get("id", ""),
+        "haiqu_job_info": (
+            json.dumps(haiqu_job_info, ensure_ascii=False, default=str)
+            if haiqu_job_info is not None
+            else ""
+        ),
         "device_time_seconds": haiqu_job.get("time", ""),
         "pre_device_pipeline_seconds": haiqu_job.get(
             "pre_device_pipeline_time",
