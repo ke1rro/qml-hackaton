@@ -1,8 +1,8 @@
 """End-to-end benchmark for the original sparse REM and Haiqu SDK.
 
 This script benchmarks complete mitigation pipelines, not the isolated matrix
-solver. It uses the same Qiskit circuits, readout noise model, shot counts, and
-target state-space sizes for both implementations.
+solver. It supports both the original state-space-size sweep and a fixed-qubit,
+fixed-depth circuit mode for larger experiments.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import argparse
 import csv
 import math
 import os
+import random
 import re
 import time
 from datetime import datetime
@@ -31,10 +32,15 @@ DEFAULT_REPORTS_DIRECTORY = Path("benchmarks_reports")
 FIELDNAMES = [
     "timestamp",
     "implementation",
+    "benchmark_mode",
     "requested_states",
     "possible_states",
     "actual_states",
     "n_qubits",
+    "target_depth",
+    "circuit_depth",
+    "two_qubit_gates",
+    "simulator_method",
     "shots",
     "repetition",
     "wall_seconds",
@@ -42,6 +48,9 @@ FIELDNAMES = [
     "baseline_rss_mib",
     "peak_rss_mib",
     "peak_rss_delta_mib",
+    "haiqu_job_id",
+    "device_time_seconds",
+    "pre_device_pipeline_seconds",
     "raw_fidelity",
     "mitigated_fidelity",
     "status",
@@ -86,6 +95,52 @@ def make_uniform_circuit(n_qubits: int) -> QuantumCircuit:
     return circuit
 
 
+def make_deep_ghz_circuit(
+    n_qubits: int,
+    target_depth: int,
+    seed: int = 42,
+) -> QuantumCircuit:
+    """Create a deep entangled circuit with a known two-state ideal output.
+
+    Random RZ and alternating CZ layers increase circuit depth without changing
+    the ideal GHZ measurement probabilities. ``target_depth`` includes the
+    final measurement layer.
+    """
+    minimum_depth = n_qubits + 1
+    if target_depth < minimum_depth:
+        raise ValueError(
+            f"target_depth must be at least {minimum_depth} for a "
+            f"{n_qubits}-qubit GHZ circuit"
+        )
+
+    circuit = QuantumCircuit(n_qubits)
+    circuit.h(0)
+    for qubit in range(n_qubits - 1):
+        circuit.cx(qubit, qubit + 1)
+
+    random_generator = random.Random(seed)
+    target_unitary_depth = target_depth - 1
+    layer = 0
+
+    while circuit.depth() < target_unitary_depth:
+        for qubit in range(n_qubits):
+            circuit.rz(
+                random_generator.uniform(-math.pi, math.pi),
+                qubit,
+            )
+
+        if circuit.depth() >= target_unitary_depth:
+            break
+
+        start_qubit = layer % 2
+        for qubit in range(start_qubit, n_qubits - 1, 2):
+            circuit.cz(qubit, qubit + 1)
+        layer += 1
+
+    circuit.measure_all()
+    return circuit
+
+
 def ideal_uniform_distribution(n_qubits: int) -> dict[str, float]:
     """Return the exact uniform distribution over all computational states."""
     states_count = 2**n_qubits
@@ -94,6 +149,22 @@ def ideal_uniform_distribution(n_qubits: int) -> dict[str, float]:
         format(index, f"0{n_qubits}b"): probability
         for index in range(states_count)
     }
+
+
+def ideal_ghz_distribution(n_qubits: int) -> dict[str, float]:
+    """Return the exact measurement distribution of an ideal GHZ state."""
+    return {
+        "0" * n_qubits: 0.5,
+        "1" * n_qubits: 0.5,
+    }
+
+
+def count_two_qubit_gates(circuit: QuantumCircuit) -> int:
+    """Count all two-qubit operations in a circuit."""
+    return sum(
+        instruction.operation.num_qubits == 2
+        for instruction in circuit.data
+    )
 
 
 def run_original(
@@ -136,7 +207,10 @@ def run_haiqu(
             else None
         ),
         include_raw=False,
-        job_name=f"rem-benchmark-{circuit.num_qubits}q",
+        job_name=(
+            f"rem-benchmark-{circuit.num_qubits}q-"
+            f"d{circuit.depth()}"
+        ),
     )
     return output, output["metrics"]["mitigated"]
 
@@ -150,9 +224,14 @@ RUNNERS = {
 def result_row(
     *,
     implementation: str,
-    requested_states: int,
+    benchmark_mode: str,
+    requested_states: int | str,
     possible_states: int,
     n_qubits: int,
+    target_depth: int | str,
+    circuit_depth: int,
+    two_qubit_gates: int,
+    simulator_method: str,
     shots: int,
     repetition: int,
     output: dict[str, Any],
@@ -162,16 +241,28 @@ def result_row(
     """Convert one successful measured run to a CSV row."""
     mitigated = output["mitigated"]
     raw = output.get("raw") or {}
+    haiqu_job = (output.get("haiqu_jobs") or {}).get("mitigated") or {}
     return {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "implementation": implementation,
+        "benchmark_mode": benchmark_mode,
         "requested_states": requested_states,
         "possible_states": possible_states,
         "actual_states": len(raw) if raw else len(mitigated),
         "n_qubits": n_qubits,
+        "target_depth": target_depth,
+        "circuit_depth": circuit_depth,
+        "two_qubit_gates": two_qubit_gates,
+        "simulator_method": simulator_method,
         "shots": shots,
         "repetition": repetition,
         **metrics,
+        "haiqu_job_id": haiqu_job.get("job_id") or haiqu_job.get("id", ""),
+        "device_time_seconds": haiqu_job.get("time", ""),
+        "pre_device_pipeline_seconds": haiqu_job.get(
+            "pre_device_pipeline_time",
+            "",
+        ),
         "raw_fidelity": hellinger_fidelity(ideal, raw) if raw else "",
         "mitigated_fidelity": hellinger_fidelity(ideal, mitigated),
         "status": "ok",
@@ -182,9 +273,14 @@ def result_row(
 def failure_row(
     *,
     implementation: str,
-    requested_states: int,
+    benchmark_mode: str,
+    requested_states: int | str,
     possible_states: int,
     n_qubits: int,
+    target_depth: int | str,
+    circuit_depth: int,
+    two_qubit_gates: int,
+    simulator_method: str,
     shots: int,
     repetition: int,
     error: Exception,
@@ -195,9 +291,14 @@ def failure_row(
         {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "implementation": implementation,
+            "benchmark_mode": benchmark_mode,
             "requested_states": requested_states,
             "possible_states": possible_states,
             "n_qubits": n_qubits,
+            "target_depth": target_depth,
+            "circuit_depth": circuit_depth,
+            "two_qubit_gates": two_qubit_gates,
+            "simulator_method": simulator_method,
             "shots": shots,
             "repetition": repetition,
             "status": "failed",
@@ -235,7 +336,10 @@ def next_report_path(reports_directory: Path) -> Path:
 
 def run_benchmark(
     *,
-    sizes: list[int],
+    sizes: list[int] | None,
+    qubits: int | None,
+    target_depth: int,
+    fixed_shots: int,
     implementations: list[str],
     warmups: int,
     repeats: int,
@@ -250,19 +354,70 @@ def run_benchmark(
         noise_model=noise_model,
     )
 
-    for requested_states in sizes:
-        n_qubits, possible_states = state_space(requested_states)
-        shots = possible_states * shots_per_state
-        circuit = make_uniform_circuit(n_qubits)
-        ideal = ideal_uniform_distribution(n_qubits)
-
-        print(
-            f"\nSize {requested_states}: {n_qubits} qubits, "
-            f"{possible_states} possible states, {shots} shots"
+    cases: list[dict[str, Any]] = []
+    if qubits is not None:
+        circuit = make_deep_ghz_circuit(qubits, target_depth)
+        cases.append(
+            {
+                "benchmark_mode": "qubits_depth",
+                "requested_states": "",
+                "possible_states": 2**qubits,
+                "n_qubits": qubits,
+                "target_depth": target_depth,
+                "shots": fixed_shots,
+                "circuit": circuit,
+                "ideal": ideal_ghz_distribution(qubits),
+            }
         )
+    else:
+        for requested_states in sizes or DEFAULT_SIZES:
+            n_qubits, possible_states = state_space(requested_states)
+            circuit = make_uniform_circuit(n_qubits)
+            cases.append(
+                {
+                    "benchmark_mode": "state_space",
+                    "requested_states": requested_states,
+                    "possible_states": possible_states,
+                    "n_qubits": n_qubits,
+                    "target_depth": "",
+                    "shots": possible_states * shots_per_state,
+                    "circuit": circuit,
+                    "ideal": ideal_uniform_distribution(n_qubits),
+                }
+            )
+
+    for case in cases:
+        benchmark_mode = case["benchmark_mode"]
+        requested_states = case["requested_states"]
+        possible_states = case["possible_states"]
+        n_qubits = case["n_qubits"]
+        target_depth_value = case["target_depth"]
+        shots = case["shots"]
+        circuit = case["circuit"]
+        ideal = case["ideal"]
+        circuit_depth = circuit.depth()
+        two_qubit_gates = count_two_qubit_gates(circuit)
+
+        if benchmark_mode == "qubits_depth":
+            print(
+                f"\nQubit/depth mode: {n_qubits} qubits, "
+                f"target depth {target_depth_value}, "
+                f"actual depth {circuit_depth}, "
+                f"{two_qubit_gates} two-qubit gates, {shots} shots"
+            )
+        else:
+            print(
+                f"\nSize {requested_states}: {n_qubits} qubits, "
+                f"{possible_states} possible states, {shots} shots"
+            )
 
         for implementation in implementations:
             runner = RUNNERS[implementation]
+            simulator_method = (
+                "matrix_product_state"
+                if implementation == "original" or n_qubits > 12
+                else "automatic"
+            )
             print(f"  {implementation}: warmup", flush=True)
 
             for warmup in range(warmups):
@@ -308,17 +463,29 @@ def run_benchmark(
                     )
                     row = result_row(
                         implementation=implementation,
+                        benchmark_mode=benchmark_mode,
                         requested_states=requested_states,
                         possible_states=possible_states,
                         n_qubits=n_qubits,
+                        target_depth=target_depth_value,
+                        circuit_depth=circuit_depth,
+                        two_qubit_gates=two_qubit_gates,
+                        simulator_method=simulator_method,
                         shots=shots,
                         repetition=repetition,
                         output=output,
                         metrics=metrics,
                         ideal=ideal,
                     )
+                    device_time = row["device_time_seconds"]
+                    device_text = (
+                        f", device={device_time}s"
+                        if device_time != ""
+                        else ""
+                    )
                     print(
-                        f"      wall={row['wall_seconds']:.3f}s, "
+                        f"      wall={row['wall_seconds']:.3f}s"
+                        f"{device_text}, "
                         f"peak={row['peak_rss_mib']:.1f}MiB, "
                         f"fidelity={row['mitigated_fidelity']:.4f}",
                         flush=True,
@@ -326,9 +493,14 @@ def run_benchmark(
                 except Exception as error:
                     row = failure_row(
                         implementation=implementation,
+                        benchmark_mode=benchmark_mode,
                         requested_states=requested_states,
                         possible_states=possible_states,
                         n_qubits=n_qubits,
+                        target_depth=target_depth_value,
+                        circuit_depth=circuit_depth,
+                        two_qubit_gates=two_qubit_gates,
+                        simulator_method=simulator_method,
                         shots=shots,
                         repetition=repetition,
                         error=error,
@@ -348,12 +520,22 @@ def run_benchmark(
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    benchmark_mode = parser.add_mutually_exclusive_group()
+    benchmark_mode.add_argument(
         "--sizes",
         type=int,
         nargs="+",
-        default=DEFAULT_SIZES,
-        help="Requested reduced-matrix sizes.",
+        default=None,
+        help=(
+            "Requested reduced-matrix sizes. Uses the default size sweep when "
+            "neither --sizes nor --qubits is provided."
+        ),
+    )
+    benchmark_mode.add_argument(
+        "--qubits",
+        type=int,
+        default=None,
+        help="Use a fixed-qubit deep GHZ benchmark instead of the size sweep.",
     )
     parser.add_argument(
         "--implementations",
@@ -364,6 +546,20 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--shots-per-state", type=int, default=10)
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=30,
+        help=(
+            "Target circuit depth, including measurements, in --qubits mode."
+        ),
+    )
+    parser.add_argument(
+        "--shots",
+        type=int,
+        default=10_000,
+        help="Fixed shot count in --qubits mode.",
+    )
     parser.add_argument(
         "--haiqu-cooldown",
         type=float,
@@ -390,6 +586,17 @@ def parse_arguments() -> argparse.Namespace:
         parser.error("--repeats must be at least 1")
     if arguments.shots_per_state < 1:
         parser.error("--shots-per-state must be at least 1")
+    if arguments.shots < 1:
+        parser.error("--shots must be at least 1")
+    if arguments.qubits is not None:
+        if arguments.qubits < 2:
+            parser.error("--qubits must be at least 2")
+        minimum_depth = arguments.qubits + 1
+        if arguments.depth < minimum_depth:
+            parser.error(
+                f"--depth must be at least {minimum_depth} for "
+                f"{arguments.qubits} qubits"
+            )
     if arguments.haiqu_cooldown < 0:
         parser.error("--haiqu-cooldown cannot be negative")
     return arguments
@@ -421,6 +628,9 @@ def main() -> None:
 
     run_benchmark(
         sizes=arguments.sizes,
+        qubits=arguments.qubits,
+        target_depth=arguments.depth,
+        fixed_shots=arguments.shots,
         implementations=arguments.implementations,
         warmups=arguments.warmups,
         repeats=arguments.repeats,
