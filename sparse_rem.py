@@ -1,11 +1,6 @@
-"""Standalone sparse readout-error mitigation (REM).
-
-Implements in Python the sparse reduced-transition-matrix method of
-Nation et al., PRX Quantum 2, 040326 (2021). Depends only on
-qiskit, qiskit-aer, numpy and scipy.
-"""
-
-from typing import Dict, List, Literal, Optional
+from importlib import import_module, util as importlib_util
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 from qiskit import ClassicalRegister, QuantumCircuit, QuantumRegister, transpile
@@ -14,6 +9,108 @@ from scipy.sparse import linalg as sparse_linalg
 from scipy.spatial.distance import pdist, squareform
 
 MatrixFormat = Literal["dense", "sparse", "auto"]
+BackendImpl = Literal["python", "cpp", "auto"]
+
+
+def _execution_seconds(result: Any) -> Optional[float]:
+    """Return backend-reported execution time when Qiskit exposes it."""
+    value = getattr(result, "time_taken", None)
+    if isinstance(value, (int, float)) and np.isfinite(value) and value >= 0:
+        return float(value)
+    return None
+
+
+def _load_cpp_backend():
+    """Load an installed extension or a local CMake development build."""
+    try:
+        return import_module("rem_cpp")
+    except ImportError as initial_error:
+        project_root = Path(__file__).resolve().parent
+        candidates = sorted(
+            project_root.glob("rem/build*/rem_cpp*.so"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for candidate in candidates:
+            spec = importlib_util.spec_from_file_location("rem_cpp", candidate)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib_util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+        raise initial_error
+
+
+def _pack_bitstrings(bitstrings: List[str], qubits: int) -> np.ndarray:
+    """Pack displayed MSB-left bitstrings into state-major LSB-first words."""
+    words = (qubits + 63) // 64
+    if words == 1:
+        return np.ascontiguousarray(
+            np.fromiter((int(state, 2) for state in bitstrings), dtype=np.uint64)
+        )
+    packed = np.zeros((len(bitstrings), words), dtype=np.uint64)
+    for row, state in enumerate(bitstrings):
+        for q, bit in enumerate(reversed(state)):
+            if bit == "1":
+                packed[row, q // 64] |= np.uint64(1) << np.uint64(q % 64)
+    return packed
+
+
+def _mitigate_probs_cpp(
+    raw_probs: Dict[str, float],
+    measured_qubits: List[int],
+    confusion_matrices_all: np.ndarray,
+    matrix_format: MatrixFormat,
+    solver_tol: float,
+    reduce_kwargs: Dict[str, Any],
+) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    backend = _load_cpp_backend()
+    bitstrings = list(raw_probs)
+    qubits = len(measured_qubits)
+    if any(len(state) != qubits for state in bitstrings):
+        raise ValueError("bitstring length must match the number of measured qubits")
+    packed = _pack_bitstrings(bitstrings, qubits)
+    raw = np.ascontiguousarray(list(raw_probs.values()), dtype=np.float64)
+    calibrations = np.ascontiguousarray(
+        confusion_matrices_all[np.asarray(measured_qubits, dtype=int)],
+        dtype=np.float64,
+    )
+    options = {
+        "backend": {
+            "dense": "dense",
+            "sparse": "explicit_sparse",
+            "auto": "auto",
+        }[matrix_format],
+        "solver": "direct" if matrix_format == "dense" else "auto",
+        "max_hamming_distance": int(reduce_kwargs.get("d", 3)),
+        "relative_tolerance": float(solver_tol),
+        "absolute_tolerance": 0.0,
+        "project_to_probability_simplex": False,
+    }
+    for name in (
+        "gmres_restart",
+        "max_iterations",
+        "threads",
+        "memory_budget_bytes",
+        "cache_topology",
+        "cache_values",
+        "graph_strategy",
+        "sparse_storage",
+        "orthogonalization",
+        "near_zero_threshold",
+    ):
+        if name in reduce_kwargs:
+            options[name] = reduce_kwargs[name]
+    output = backend.mitigate_packed(packed, raw, calibrations, qubits, options)
+    unique_mapping = np.asarray(output["original_to_unique"])
+    quasi_vector = np.asarray(output["quasi_probabilities"])
+    quasi = {
+        state: float(quasi_vector[int(unique_mapping[index])])
+        for index, state in enumerate(bitstrings)
+    }
+    diagnostics = dict(output["diagnostics"])
+    diagnostics["backend_impl"] = "cpp"
+    return quasi, diagnostics
 
 
 def get_physical_active_qubits(circuit: QuantumCircuit) -> List[int]:
@@ -156,8 +253,38 @@ def _mitigate_probs(
     confusion_matrices_all: np.ndarray,
     matrix_format: MatrixFormat = "auto",
     solver_tol: float = 1e-6,
+    backend_impl: BackendImpl = "auto",
+    project_to_probability_simplex: bool = True,
+    return_details: bool = False,
     **reduce_kwargs,
-) -> Dict[str, float]:
+) -> Any:
+    if backend_impl not in ("python", "cpp", "auto"):
+        raise ValueError("backend_impl must be 'python', 'cpp', or 'auto'")
+    if backend_impl in ("cpp", "auto"):
+        try:
+            quasi, diagnostics = _mitigate_probs_cpp(
+                raw_probs,
+                measured_qubits,
+                confusion_matrices_all,
+                matrix_format,
+                solver_tol,
+                reduce_kwargs,
+            )
+        except (ImportError, ModuleNotFoundError):
+            if backend_impl == "cpp":
+                raise RuntimeError(
+                    "backend_impl='cpp' requested, but rem_cpp is not built or installed"
+                ) from None
+        else:
+            mitigated = (
+                get_nearest_probabilities(quasi, qubits_count)
+                if project_to_probability_simplex
+                else quasi
+            )
+            if return_details:
+                return mitigated, quasi, diagnostics
+            return mitigated
+
     bitstrings = list(raw_probs.keys())
     raw_dense_array = np.array(list(raw_probs.values()), dtype=float)
 
@@ -171,8 +298,23 @@ def _mitigate_probs(
     else:
         mitigated = np.linalg.solve(reduced_confusion_matrix, raw_dense_array)
 
-    mitigated_counts = dict(zip(bitstrings, mitigated))
-    return get_nearest_probabilities(mitigated_counts, qubits_count)
+    quasi = dict(zip(bitstrings, mitigated))
+    output = (
+        get_nearest_probabilities(quasi, qubits_count)
+        if project_to_probability_simplex
+        else quasi
+    )
+    if return_details:
+        residual = np.linalg.norm(reduced_confusion_matrix @ mitigated - raw_dense_array)
+        diagnostics = {
+            "selected_backend": "explicit_sparse" if use_sparse else "dense",
+            "selected_solver": "lgmres" if use_sparse else "numpy_solve",
+            "residual_norm": float(residual),
+            "converged": bool(not use_sparse or info == 0),
+            "backend_impl": "python",
+        }
+        return output, quasi, diagnostics
+    return output
 
 
 def _counts_to_probs(counts: Dict[str, float]) -> Dict[str, float]:
@@ -191,7 +333,11 @@ def mitigate_readout_errors(
     calibration_shots: Optional[int] = None,
     n_qubits: Optional[int] = None,
     seed_transpiler: Optional[int] = None,
-) -> Dict[str, Dict[str, float]]:
+    backend_impl: BackendImpl = "auto",
+    project_to_probability_simplex: bool = True,
+    return_diagnostics: bool = False,
+    **solver_options,
+) -> Dict[str, Any]:
     """Run ``circuit`` on ``backend`` and return raw and readout-mitigated probabilities.
 
     Args:
@@ -206,6 +352,13 @@ def mitigate_readout_errors(
         calibration_shots: Shots per calibration circuit (defaults to ``shots``).
         n_qubits: Number of physical qubits to calibrate (defaults to ``backend.num_qubits``).
         seed_transpiler: Optional transpiler seed for reproducibility.
+        backend_impl: Computational core: "python", "cpp", or "auto".
+        project_to_probability_simplex: If true, return the nearest valid
+            distribution under ``"mitigated"``. The quasi-distribution remains
+            available when ``return_diagnostics`` is true.
+        return_diagnostics: Include the quasi-distribution and solver diagnostics.
+        solver_options: C++ options such as ``d``, ``threads``,
+            ``gmres_restart``, and ``memory_budget_bytes``.
 
     Returns:
         Dict with keys ``"raw"`` and ``"mitigated"``, plus ``"measured_physical_qubits"``.
@@ -223,18 +376,47 @@ def mitigate_readout_errors(
 
     calib_circuits = _generate_calibration_circuits(n_qubits, local)
     calib_result = backend.run(calib_circuits, shots=calibration_shots).result()
+    calibration_device_seconds = _execution_seconds(calib_result)
     calib_probs = [_counts_to_probs(calib_result.get_counts(i)) for i in range(len(calib_circuits))]
     confusion_matrices = _calibrate_confusion_matrices(calib_probs, n_qubits, local)
 
-    raw_counts = backend.run(transpiled, shots=shots).result().get_counts()
+    raw_result = backend.run(transpiled, shots=shots).result()
+    raw_device_seconds = _execution_seconds(raw_result)
+    raw_counts = raw_result.get_counts()
     raw_probs = _counts_to_probs(raw_counts)
 
-    mitigated_probs = _mitigate_probs(
-        raw_probs, qubits_count, measured_qubits, confusion_matrices, matrix_format
+    mitigation_output = _mitigate_probs(
+        raw_probs,
+        qubits_count,
+        measured_qubits,
+        confusion_matrices,
+        matrix_format,
+        backend_impl=backend_impl,
+        project_to_probability_simplex=project_to_probability_simplex,
+        return_details=return_diagnostics,
+        **solver_options,
     )
+    if return_diagnostics:
+        mitigated_probs, quasi_probs, diagnostics = mitigation_output
+    else:
+        mitigated_probs = mitigation_output
 
-    return {
+    output = {
         "raw": raw_probs,
         "mitigated": mitigated_probs,
         "measured_physical_qubits": measured_qubits,
     }
+    if return_diagnostics:
+        if (
+            calibration_device_seconds is not None
+            and raw_device_seconds is not None
+        ):
+            diagnostics["device_seconds"] = (
+                calibration_device_seconds + raw_device_seconds
+            )
+            diagnostics["device_time_source"] = "qiskit_result.time_taken"
+        diagnostics["calibration_device_seconds"] = calibration_device_seconds
+        diagnostics["raw_device_seconds"] = raw_device_seconds
+        output["quasi"] = quasi_probs
+        output["diagnostics"] = diagnostics
+    return output
