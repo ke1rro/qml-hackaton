@@ -1,11 +1,15 @@
 haiqu-sdk
 python-dotenv
-psutil
+
 numpy
 scipy
-matplotlib
 pandas
+matplotlib
+psutil
+
 qiskit
 qiskit-aer
 qiskit-ibm-runtime
+
+pybind11
 ipykernel
