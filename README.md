@@ -6,13 +6,6 @@ for quantum computing.
 The project was developed during the **Haiqu Hackathon at the UCU Quantum Machine
 Learning School 2026**, where it received **2nd place**.
 
-The implementation is based on the scalable REM approach from:
-
-> P. D. Nation, H. Kang, N. Sundaresan, J. M. Gambetta,
-> **Scalable Mitigation of Measurement Errors on Quantum Computers**,
-> PRX Quantum 2, 040326 (2021).
-> https://doi.org/10.1103/PRXQuantum.2.040326
-
 ## Implementation
 
 The mitigation problem is solved in the reduced space of observed bitstrings rather
